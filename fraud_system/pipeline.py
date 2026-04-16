@@ -32,6 +32,8 @@ class FraudDetectionPipeline:
         top_k: int = 0,
     ) -> DetectionResult:
         self.progress.stage(f"Loaded dataset from {self.settings.dataset_dir.name}")
+        if self.orchestrator.enabled:
+            self.progress.stage(f"Langfuse session id: {self.orchestrator.session_id}")
         candidates = score_transactions(self.dataset)
         self.progress.stage(f"Scored {len(candidates)} user transactions")
         reviewed: list[dict] = []
@@ -78,7 +80,12 @@ class FraudDetectionPipeline:
         ]
         fraud_candidates = sorted(
             fraud_candidates,
-            key=lambda item: (item["final_score"], item["combined_score"], item["economic_risk_score"]),
+            key=lambda item: (
+                item["final_score"],
+                item["combined_score"],
+                item["sequence_score"],
+                item["economic_risk_score"],
+            ),
             reverse=True,
         )
         if top_k > 0:
@@ -99,23 +106,24 @@ class FraudDetectionPipeline:
     ) -> list[CandidateTransaction]:
         frame = pd.DataFrame(scored_items)
         frame = frame.sort_values(
-            by=["combined_score", "economic_risk_score", "heuristic_score"],
+            by=["combined_score", "sequence_score", "economic_risk_score", "heuristic_score"],
             ascending=False,
         )
         shortlist = frame[
             (frame["combined_score"] >= 0.75)
+            | (frame["sequence_score"] >= 1.0)
             | (frame["economic_risk_score"] >= 1.0)
             | (frame["heuristic_score"] >= 1.0)
         ]
-        top_per_sender = (
-            shortlist.sort_values(
-                by=["combined_score", "economic_risk_score", "heuristic_score"],
-                ascending=False,
-            )
-            .groupby("sender_id", sort=False)
-            .head(12)
+        global_cap = max(60, min(len(frame), int(len(frame) * 0.35)))
+        sender_cap = 24
+
+        top_global = shortlist.head(global_cap)
+        top_per_sender = shortlist.groupby("sender_id", sort=False).head(sender_cap)
+        merged = pd.concat([top_global, top_per_sender], ignore_index=True).drop_duplicates(
+            subset=["transaction_id"]
         )
-        ids = top_per_sender["transaction_id"].tolist()
+        ids = merged["transaction_id"].tolist()
         return [candidate_by_id[item_id] for item_id in ids if item_id in candidate_by_id]
 
     def _build_llm_batches(
@@ -153,12 +161,14 @@ def _serialize_candidate(
         "transaction_type": candidate.transaction.transaction_type,
         "heuristic_score": candidate.heuristic_score,
         "economic_risk_score": candidate.economic_risk_score,
+        "sequence_score": candidate.sequence_score,
         "combined_score": candidate.combined_score,
         "final_label": final_label,
         "final_score": round(final_score, 3),
         "reasons": final_reasons,
         "candidate_reasons": candidate.reasons,
         "feature_map": candidate.feature_map,
+        "fraud_archetype": candidate.network_summary["fraud_archetype"],
         "recent_phishing_examples": candidate.communication_summary.recent_phishing_examples,
     }
 

@@ -53,12 +53,13 @@ class CandidateTransaction:
     user: UserProfile
     heuristic_score: float
     economic_risk_score: float
+    sequence_score: float
     combined_score: float
     reasons: list[str]
     feature_map: dict[str, float | int | str | bool]
     communication_summary: CommunicationSummary
     location_summary: dict[str, str | float | bool]
-    network_summary: dict[str, str | int | bool]
+    network_summary: dict[str, str | int | float | bool]
 
 
 def _message_risk(message: Communication) -> bool:
@@ -166,6 +167,24 @@ def _communication_summary(
     )
 
 
+def _latest_phishing_delta_hours(
+    user: UserProfile,
+    transaction: Transaction,
+    communications: list[Communication],
+) -> float | None:
+    phishing_messages = [
+        item
+        for item in communications
+        if item.user_biotag == user.biotag
+        and item.timestamp <= transaction.timestamp
+        and _message_risk(item)
+    ]
+    if not phishing_messages:
+        return None
+    latest = max(phishing_messages, key=lambda item: item.timestamp)
+    return (transaction.timestamp - latest.timestamp).total_seconds() / 3600
+
+
 def _nearest_location(
     user: UserProfile,
     transaction: Transaction,
@@ -232,6 +251,129 @@ def _future_recurring_match(
     if len(future_matches) < 2:
         return False
     return all(_looks_like_recurring_obligation(item.description) for item in future_matches[:3])
+
+
+def _unusual_hour(transaction: Transaction, history: list[Transaction]) -> bool:
+    if len(history) < 6:
+        return False
+    prior_hours = [item.timestamp.hour for item in history]
+    current_bucket = transaction.timestamp.hour // 6
+    bucket_counts = Counter(hour // 6 for hour in prior_hours)
+    return bucket_counts[current_bucket] <= 1
+
+
+def _new_payment_channel(transaction: Transaction, history: list[Transaction]) -> bool:
+    payment_method = transaction.payment_method.strip().lower()
+    if not payment_method:
+        return False
+    prior_methods = {
+        item.payment_method.strip().lower()
+        for item in history
+        if item.payment_method.strip()
+    }
+    return bool(prior_methods) and payment_method not in prior_methods
+
+
+def _recurring_break(
+    transaction: Transaction,
+    prior_same_recipient: list[Transaction],
+    amount_zscore: float,
+    description_shift: bool,
+) -> bool:
+    if len(prior_same_recipient) < 2:
+        return False
+    if description_shift and amount_zscore >= 1.0:
+        return True
+    latest_gap_days = (
+        transaction.timestamp - prior_same_recipient[-1].timestamp
+    ).total_seconds() / 86400
+    prior_gap_days = [
+        (current.timestamp - previous.timestamp).total_seconds() / 86400
+        for previous, current in zip(prior_same_recipient, prior_same_recipient[1:])
+    ]
+    if not prior_gap_days:
+        return False
+    typical_gap = sum(prior_gap_days) / len(prior_gap_days)
+    return latest_gap_days < typical_gap * 0.4 or latest_gap_days > typical_gap * 1.8
+
+
+def _sequence_risk(
+    transaction: Transaction,
+    history: list[Transaction],
+    comms: CommunicationSummary,
+    latest_phishing_hours: float | None,
+    new_recipient: bool,
+    amount_zscore: float,
+    drain_ratio: float,
+    unusual_hour: bool,
+    new_payment_channel: bool,
+    recurring_break: bool,
+    recurring_same_recipient: bool,
+    recipient_global_count: int,
+    first_recurring_obligation: bool,
+) -> tuple[float, list[str], str]:
+    score = 0.0
+    reasons: list[str] = []
+    archetypes: list[str] = []
+
+    if latest_phishing_hours is not None and latest_phishing_hours <= 72:
+        if new_recipient and transaction.transaction_type == "transfer":
+            score += 1.7
+            reasons.append("transfer follows phishing communication within 72h")
+            archetypes.append("phishing_to_new_payee")
+        elif transaction.transaction_type in {"e-commerce", "direct debit"}:
+            score += 1.1
+            reasons.append("remote charge follows phishing communication within 72h")
+            archetypes.append("phishing_to_remote_charge")
+        elif drain_ratio >= 0.18:
+            score += 0.8
+            reasons.append("meaningful balance drain shortly after phishing")
+            archetypes.append("phishing_to_balance_drain")
+
+    if unusual_hour and transaction.amount >= 200:
+        score += 0.7
+        reasons.append("activity lands in a rare time window for sender")
+        archetypes.append("temporal_shift")
+
+    if new_payment_channel and transaction.transaction_type in {"e-commerce", "in-person payment"}:
+        score += 0.5
+        reasons.append("uses a previously unseen payment channel")
+        archetypes.append("channel_shift")
+
+    if recurring_break and not first_recurring_obligation:
+        score += 1.2
+        reasons.append("known recipient pattern breaks in timing or purpose")
+        archetypes.append("recurring_pattern_break")
+
+    if (
+        recipient_global_count == 1
+        and new_recipient
+        and transaction.amount >= 250
+        and transaction.transaction_type in {"transfer", "direct debit", "e-commerce"}
+    ):
+        score += 0.9
+        reasons.append("single-use counterparty paired with material amount")
+        archetypes.append("single_use_counterparty")
+
+    if (
+        len(history) >= 4
+        and new_recipient
+        and comms.recent_phishing_count >= 1
+        and drain_ratio >= 0.12
+    ):
+        score += 0.8
+        reasons.append("sender shifts from normal behavior into a risky sequence")
+        archetypes.append("behavioral_shift_after_contact")
+
+    if recurring_same_recipient and not recurring_break:
+        score -= 0.8
+        reasons.append("recipient pattern remains stable across the sender timeline")
+
+    if first_recurring_obligation:
+        score -= 1.0
+
+    archetype = ",".join(dict.fromkeys(archetypes)) if archetypes else "none"
+    return round(score, 3), reasons, archetype
 
 
 def _economic_risk(
@@ -340,6 +482,8 @@ def score_transactions(dataset: Dataset) -> list[CandidateTransaction]:
             len(prior_same_recipient) == 0
             and _future_recurring_match(transaction, dataset.transactions)
         )
+        unusual_hour = _unusual_hour(transaction, history)
+        new_payment_channel = _new_payment_channel(transaction, history)
         recipient_description_shift = False
         if prior_same_recipient and transaction.description:
             current_tokens = _description_tokens(transaction.description)
@@ -349,6 +493,13 @@ def score_transactions(dataset: Dataset) -> list[CandidateTransaction]:
             if current_tokens and prior_tokens:
                 overlap = len(current_tokens & prior_tokens) / max(1, len(current_tokens | prior_tokens))
                 recipient_description_shift = overlap < 0.25
+        recurring_break = _recurring_break(
+            transaction=transaction,
+            prior_same_recipient=prior_same_recipient,
+            amount_zscore=amount_zscore,
+            description_shift=recipient_description_shift,
+        )
+        latest_phishing_hours = _latest_phishing_delta_hours(user, transaction, dataset.communications)
 
         reasons: list[str] = []
         score = 0.0
@@ -425,7 +576,22 @@ def score_transactions(dataset: Dataset) -> list[CandidateTransaction]:
             structured_description=_description_flag(transaction.description),
             first_recurring_obligation=first_recurring_obligation,
         )
-        combined_score = score + 1.35 * economic_risk_score
+        sequence_score, sequence_reasons, fraud_archetype = _sequence_risk(
+            transaction=transaction,
+            history=history,
+            comms=comms,
+            latest_phishing_hours=latest_phishing_hours,
+            new_recipient=new_recipient,
+            amount_zscore=amount_zscore,
+            drain_ratio=drain_ratio,
+            unusual_hour=unusual_hour,
+            new_payment_channel=new_payment_channel,
+            recurring_break=recurring_break,
+            recurring_same_recipient=recurring_same_recipient,
+            recipient_global_count=recipient_global_count,
+            first_recurring_obligation=first_recurring_obligation,
+        )
+        combined_score = score + 1.2 * economic_risk_score + 1.1 * sequence_score
 
         network_summary = {
             "new_recipient": new_recipient,
@@ -435,6 +601,13 @@ def score_transactions(dataset: Dataset) -> list[CandidateTransaction]:
             "recurring_same_recipient": recurring_same_recipient,
             "first_recurring_obligation": first_recurring_obligation,
             "recipient_description_shift": recipient_description_shift,
+            "recurring_break": recurring_break,
+            "unusual_hour": unusual_hour,
+            "new_payment_channel": new_payment_channel,
+            "latest_phishing_hours": round(latest_phishing_hours, 2)
+            if latest_phishing_hours is not None
+            else -1.0,
+            "fraud_archetype": fraud_archetype,
         }
 
         feature_map = {
@@ -453,6 +626,7 @@ def score_transactions(dataset: Dataset) -> list[CandidateTransaction]:
             "description": transaction.description or "",
             "location": transaction.location or "",
             "economic_risk_score": economic_risk_score,
+            "sequence_score": sequence_score,
             "combined_score": round(combined_score, 3),
         }
 
@@ -462,8 +636,9 @@ def score_transactions(dataset: Dataset) -> list[CandidateTransaction]:
                 user=user,
                 heuristic_score=round(score, 3),
                 economic_risk_score=economic_risk_score,
+                sequence_score=sequence_score,
                 combined_score=round(combined_score, 3),
-                reasons=reasons + economic_reasons,
+                reasons=reasons + economic_reasons + sequence_reasons,
                 feature_map=feature_map,
                 communication_summary=comms,
                 location_summary=location,
@@ -485,7 +660,9 @@ def baseline_decision(candidate: CandidateTransaction) -> tuple[bool, str]:
     recurring_same_recipient = bool(candidate.network_summary["recurring_same_recipient"])
     first_recurring_obligation = bool(candidate.network_summary["first_recurring_obligation"])
     recipient_description_shift = bool(candidate.network_summary["recipient_description_shift"])
+    recurring_break = bool(candidate.network_summary["recurring_break"])
     drain_ratio = float(candidate.feature_map["drain_ratio"])
+    sequence_score = float(candidate.feature_map["sequence_score"])
     structured = bool(candidate.network_summary["description_is_structured"])
     transaction_type = str(candidate.feature_map["transaction_type"])
     description = str(candidate.feature_map["description"]).lower()
@@ -510,6 +687,7 @@ def baseline_decision(candidate: CandidateTransaction) -> tuple[bool, str]:
             and recipient_description_shift
             and not recurring_same_recipient
         )
+        or (recurring_break and sequence_score >= 1.0 and candidate.combined_score >= 3.2)
         or (phishing >= 1 and drain_ratio >= 0.25 and not structured)
     )
     if first_recurring_obligation:

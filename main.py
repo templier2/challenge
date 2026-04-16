@@ -21,6 +21,10 @@ def parse_args() -> argparse.Namespace:
         help="Print the full candidate report instead of only fraud transaction IDs.",
     )
     parser.add_argument(
+        "--output-file",
+        help="Path to the ASCII output file where suspicious transaction IDs will be written, one per line.",
+    )
+    parser.add_argument(
         "--threshold",
         type=float,
         default=0.5,
@@ -38,11 +42,19 @@ def parse_args() -> argparse.Namespace:
         default=0.75,
         help="Upper bound for reported suspicious transactions as a fraction of all scored user transactions.",
     )
+    parser.add_argument(
+        "--print-langfuse-session",
+        action="store_true",
+        help="Print Langfuse session id to stdout before transaction IDs.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if not args.report and not args.output_file:
+        raise SystemExit("--output-file is required unless --report is used.")
+
     pipeline = build_pipeline(args.dataset_dir)
     result = pipeline.run(
         threshold=args.threshold,
@@ -57,8 +69,16 @@ def main() -> None:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
 
-    for transaction_id in result.fraud_transaction_ids:
-        print(transaction_id)
+    if args.print_langfuse_session:
+        print(f"langfuse_session_id={pipeline.orchestrator.session_id}")
+        print(f"llm_enabled={str(pipeline.orchestrator.enabled).lower()}")
+        print(f"langfuse_enabled={str(pipeline.settings.langfuse_enabled).lower()}")
+
+    output_path = args.output_file
+    if output_path is not None:
+        with open(output_path, "w", encoding="ascii", newline="\n") as handle:
+            for transaction_id in result.fraud_transaction_ids:
+                handle.write(f"{transaction_id}\n")
 
 
 if __name__ == "__main__":

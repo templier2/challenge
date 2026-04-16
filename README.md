@@ -29,18 +29,24 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-3. Запустить:
+3. Запустить и сохранить сабмит в ASCII-файл:
 
 ```bash
-python main.py
+python main.py --output-file submission.txt
 ```
 
-Вернется JSON-массив с `transaction_id`, которые система посчитала fraud.
+В `submission.txt` будет построчный список `transaction_id`, как требует задача.
 
 Полный отчет по кандидатам:
 
 ```bash
 python main.py --report
+```
+
+Запуск на конкретном датасете:
+
+```bash
+python main.py --dataset-dir "Brave New World - train" --output-file brave_submission.txt
 ```
 
 ## Переменные окружения
