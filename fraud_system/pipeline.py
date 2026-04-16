@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import pandas as pd
+
 from fraud_system.agents import FraudAgentOrchestrator
 from fraud_system.config import Settings, load_settings
 from fraud_system.data import load_dataset
 from fraud_system.features import CandidateTransaction, baseline_decision, score_transactions
+from fraud_system.progress import ProgressReporter
 
 
 @dataclass(slots=True)
@@ -20,6 +23,7 @@ class FraudDetectionPipeline:
         self.settings = settings
         self.dataset = load_dataset(settings.dataset_dir)
         self.orchestrator = FraudAgentOrchestrator(settings)
+        self.progress = ProgressReporter(enabled=True)
 
     def run(
         self,
@@ -27,9 +31,12 @@ class FraudDetectionPipeline:
         max_fraud_ratio: float = 0.75,
         top_k: int = 0,
     ) -> DetectionResult:
+        self.progress.stage(f"Loaded dataset from {self.settings.dataset_dir.name}")
         candidates = score_transactions(self.dataset)
+        self.progress.stage(f"Scored {len(candidates)} user transactions")
         reviewed: list[dict] = []
         scored_items: list[dict] = []
+        candidate_by_id = {candidate.transaction.transaction_id: candidate for candidate in candidates}
 
         for candidate in candidates:
             baseline_fraud, baseline_reason = baseline_decision(candidate)
@@ -37,15 +44,31 @@ class FraudDetectionPipeline:
             final_score = candidate.combined_score
             final_reasons = [baseline_reason]
 
-            if self.orchestrator.enabled:
-                agent_decision = self.orchestrator.evaluate(candidate)
-                final_label = agent_decision.label
-                final_score = max(final_score, agent_decision.score)
-                final_reasons = agent_decision.reasons or final_reasons
-
             item = _serialize_candidate(candidate, final_label, final_score, final_reasons)
             reviewed.append(item)
             scored_items.append(item)
+
+        if self.orchestrator.enabled:
+            llm_candidates = self._select_llm_candidates(candidate_by_id, scored_items)
+            batches = self._build_llm_batches(llm_candidates, batch_size=18)
+            self.progress.stage(
+                f"Prepared {len(llm_candidates)} candidates for LLM rerank in {len(batches)} batches"
+            )
+            for idx, batch in enumerate(batches, start=1):
+                decisions = self.orchestrator.evaluate_batch(batch)
+                for candidate in batch:
+                    decision = decisions.get(candidate.transaction.transaction_id)
+                    if not decision:
+                        continue
+                    for item in scored_items:
+                        if item["transaction_id"] != candidate.transaction.transaction_id:
+                            continue
+                        item["final_label"] = decision.label
+                        item["final_score"] = round(max(item["final_score"], decision.score), 3)
+                        if decision.reasons:
+                            item["reasons"] = decision.reasons
+                        break
+                self.progress.progress("LLM rerank", idx, len(batches))
 
         max_fraud_count = max(1, int(len(scored_items) * max_fraud_ratio))
         fraud_candidates = [
@@ -68,6 +91,51 @@ class FraudDetectionPipeline:
             fraud_transaction_ids=fraud_ids,
             reviewed_candidates=reviewed,
         )
+
+    def _select_llm_candidates(
+        self,
+        candidate_by_id: dict[str, CandidateTransaction],
+        scored_items: list[dict],
+    ) -> list[CandidateTransaction]:
+        frame = pd.DataFrame(scored_items)
+        frame = frame.sort_values(
+            by=["combined_score", "economic_risk_score", "heuristic_score"],
+            ascending=False,
+        )
+        shortlist = frame[
+            (frame["combined_score"] >= 0.75)
+            | (frame["economic_risk_score"] >= 1.0)
+            | (frame["heuristic_score"] >= 1.0)
+        ]
+        top_per_sender = (
+            shortlist.sort_values(
+                by=["combined_score", "economic_risk_score", "heuristic_score"],
+                ascending=False,
+            )
+            .groupby("sender_id", sort=False)
+            .head(12)
+        )
+        ids = top_per_sender["transaction_id"].tolist()
+        return [candidate_by_id[item_id] for item_id in ids if item_id in candidate_by_id]
+
+    def _build_llm_batches(
+        self,
+        candidates: list[CandidateTransaction],
+        batch_size: int,
+    ) -> list[list[CandidateTransaction]]:
+        grouped: dict[str, list[CandidateTransaction]] = {}
+        for candidate in candidates:
+            grouped.setdefault(candidate.transaction.sender_id, []).append(candidate)
+        batches: list[list[CandidateTransaction]] = []
+        for sender_id in sorted(grouped):
+            sender_candidates = sorted(
+                grouped[sender_id],
+                key=lambda item: item.combined_score,
+                reverse=True,
+            )
+            for start in range(0, len(sender_candidates), batch_size):
+                batches.append(sender_candidates[start : start + batch_size])
+        return batches
 
 
 def _serialize_candidate(
