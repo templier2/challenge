@@ -83,7 +83,9 @@ class FraudDetectionPipeline:
         fraud_candidates = [
             item
             for item in scored_items
-            if item["final_label"] == "fraud" or item["final_score"] >= threshold
+            if item["final_label"] == "fraud"
+            or item["final_score"] >= threshold
+            or self._passes_borderline_rule(item, threshold)
         ]
         fraud_candidates = sorted(
             fraud_candidates,
@@ -106,6 +108,49 @@ class FraudDetectionPipeline:
             fraud_transaction_ids=fraud_ids,
             reviewed_candidates=reviewed,
         )
+
+    def _passes_borderline_rule(self, item: dict, threshold: float) -> bool:
+        score = float(item["final_score"])
+        if score < 3.0 or score >= threshold:
+            return False
+
+        feature_map = item.get("feature_map", {})
+        transaction_type = str(item.get("transaction_type", ""))
+        amount = float(item.get("amount", 0.0))
+        description = str(feature_map.get("description", "")).lower()
+        recent_phishing_count = int(feature_map.get("recent_phishing_count", 0))
+        payment_issue_count = int(feature_map.get("payment_issue_count", 0))
+        recipient_global_count = int(feature_map.get("recipient_global_count", 0))
+        new_recipient = bool(feature_map.get("new_recipient", False))
+        archetype = str(item.get("fraud_archetype", ""))
+
+        if (
+            transaction_type in {"direct debit", "e-commerce"}
+            and new_recipient
+            and recipient_global_count == 1
+        ):
+            return True
+        if "payment_issue_to_remote_charge" in archetype:
+            return True
+        if (
+            transaction_type == "transfer"
+            and recent_phishing_count >= 2
+            and any(marker in description for marker in ("bill", "utility bill", "phone bill"))
+        ):
+            return True
+        if (
+            transaction_type == "e-commerce"
+            and amount >= 700
+            and recent_phishing_count >= 1
+        ):
+            return True
+        if (
+            transaction_type == "direct debit"
+            and payment_issue_count >= 1
+            and recent_phishing_count >= 1
+        ):
+            return True
+        return False
 
     def _select_llm_candidates(
         self,
