@@ -30,9 +30,40 @@ def parse_args() -> argparse.Namespace:
         help="Enable optional audio transcription input if the dataset contains an audio directory.",
     )
     parser.add_argument(
+        "--campaign-features",
+        action="store_true",
+        help="Enable cross-user campaign/template scoring features.",
+    )
+    parser.add_argument(
+        "--domain-features",
+        action="store_true",
+        help="Enable brand/domain mismatch scoring features from emails and messages.",
+    )
+    parser.add_argument(
+        "--credential-link-features",
+        action="store_true",
+        help="Enable credential-harvest link scoring features from emails and messages.",
+    )
+    parser.add_argument(
+        "--message-transaction-fit",
+        action="store_true",
+        help="Enable message-to-transaction semantic compatibility features.",
+    )
+    parser.add_argument(
+        "--bill-pattern-features",
+        action="store_true",
+        help="Enable recurring-legit vs one-off fake bill-like transfer features.",
+    )
+    parser.add_argument(
+        "--llm-concurrency",
+        type=int,
+        default=2,
+        help="Maximum number of LLM rerank batches to run in parallel.",
+    )
+    parser.add_argument(
         "--threshold",
         type=float,
-        default=0.5,
+        default=1.0,
         help="Fraud score threshold used when building the final suspicious set.",
     )
     parser.add_argument(
@@ -60,7 +91,16 @@ def main() -> None:
     if not args.report and not args.output_file:
         raise SystemExit("--output-file is required unless --report is used.")
 
-    pipeline = build_pipeline(args.dataset_dir, include_audio=args.audio)
+    pipeline = build_pipeline(
+        args.dataset_dir,
+        include_audio=args.audio,
+        enable_campaign_features=args.campaign_features,
+        enable_domain_features=args.domain_features,
+        enable_credential_link_features=args.credential_link_features,
+        enable_message_transaction_fit=args.message_transaction_fit,
+        enable_bill_pattern_features=args.bill_pattern_features,
+        llm_concurrency=args.llm_concurrency,
+    )
     result = pipeline.run(
         threshold=args.threshold,
         max_fraud_ratio=args.max_fraud_ratio,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,7 +35,7 @@ class FraudDetectionPipeline:
         self.progress.stage(f"Loaded dataset from {self.settings.dataset_dir.name}")
         if self.orchestrator.enabled:
             self.progress.stage(f"Langfuse session id: {self.orchestrator.session_id}")
-        candidates = score_transactions(self.dataset)
+        candidates = score_transactions(self.dataset, self.settings)
         self.progress.stage(f"Scored {len(candidates)} user transactions")
         reviewed: list[dict] = []
         scored_items: list[dict] = []
@@ -56,21 +57,27 @@ class FraudDetectionPipeline:
             self.progress.stage(
                 f"Prepared {len(llm_candidates)} candidates for LLM rerank in {len(batches)} batches"
             )
-            for idx, batch in enumerate(batches, start=1):
-                decisions = self.orchestrator.evaluate_batch(batch)
-                for candidate in batch:
-                    decision = decisions.get(candidate.transaction.transaction_id)
-                    if not decision:
-                        continue
-                    for item in scored_items:
-                        if item["transaction_id"] != candidate.transaction.transaction_id:
+            item_by_id = {item["transaction_id"]: item for item in scored_items}
+            max_workers = min(self.settings.llm_concurrency, max(1, len(batches)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(self.orchestrator.evaluate_batch, batch): batch for batch in batches
+                }
+                for idx, future in enumerate(as_completed(future_map), start=1):
+                    batch = future_map[future]
+                    decisions = future.result()
+                    for candidate in batch:
+                        decision = decisions.get(candidate.transaction.transaction_id)
+                        if not decision:
+                            continue
+                        item = item_by_id.get(candidate.transaction.transaction_id)
+                        if not item:
                             continue
                         item["final_label"] = decision.label
                         item["final_score"] = round(max(item["final_score"], decision.score), 3)
                         if decision.reasons:
                             item["reasons"] = decision.reasons
-                        break
-                self.progress.progress("LLM rerank", idx, len(batches))
+                    self.progress.progress("LLM rerank", idx, len(batches))
 
         max_fraud_count = max(1, int(len(scored_items) * max_fraud_ratio))
         fraud_candidates = [
@@ -83,6 +90,7 @@ class FraudDetectionPipeline:
             key=lambda item: (
                 item["final_score"],
                 item["combined_score"],
+                item["campaign_score"],
                 item["sequence_score"],
                 item["economic_risk_score"],
             ),
@@ -106,26 +114,28 @@ class FraudDetectionPipeline:
     ) -> list[CandidateTransaction]:
         frame = pd.DataFrame(scored_items)
         frame = frame.sort_values(
-            by=["combined_score", "sequence_score", "economic_risk_score", "heuristic_score"],
+            by=["combined_score", "campaign_score", "sequence_score", "economic_risk_score", "heuristic_score"],
             ascending=False,
         )
         strong = frame[
-            (frame["combined_score"] >= 2.5)
+            (frame["combined_score"] >= 3.0)
+            | (frame["campaign_score"] >= 1.0)
             | (frame["sequence_score"] >= 1.5)
             | (frame["economic_risk_score"] >= 2.0)
-            | (frame["final_label"] == "fraud")
+            | ((frame["final_label"] == "fraud") & (frame["combined_score"] >= 2.0))
         ]
         reserve = frame[
-            (frame["combined_score"] >= 0.75)
+            (frame["combined_score"] >= 1.25)
+            | (frame["campaign_score"] >= 0.7)
             | (frame["sequence_score"] >= 1.0)
-            | (frame["economic_risk_score"] >= 1.0)
-            | (frame["heuristic_score"] >= 1.0)
+            | (frame["economic_risk_score"] >= 1.4)
+            | (frame["heuristic_score"] >= 1.4)
         ]
         reserve = reserve[~reserve["transaction_id"].isin(set(strong["transaction_id"]))]
 
-        strong_sender_cap = 18
-        reserve_sender_cap = 8
-        reserve_global_cap = max(40, min(len(frame), int(len(frame) * 0.15)))
+        strong_sender_cap = 14
+        reserve_sender_cap = 4
+        reserve_global_cap = max(24, min(len(frame), int(len(frame) * 0.08)))
 
         strong_per_sender = strong.groupby("sender_id", sort=False).head(strong_sender_cap)
         reserve_global = reserve.head(reserve_global_cap)
@@ -176,6 +186,7 @@ def _serialize_candidate(
         "heuristic_score": candidate.heuristic_score,
         "economic_risk_score": candidate.economic_risk_score,
         "sequence_score": candidate.sequence_score,
+        "campaign_score": candidate.campaign_score,
         "combined_score": candidate.combined_score,
         "final_label": final_label,
         "final_score": round(final_score, 3),
@@ -183,6 +194,7 @@ def _serialize_candidate(
         "candidate_reasons": candidate.reasons,
         "feature_map": candidate.feature_map,
         "fraud_archetype": candidate.network_summary["fraud_archetype"],
+        "campaign_tag": candidate.network_summary["campaign_tag"],
         "recent_phishing_examples": candidate.communication_summary.recent_phishing_examples,
     }
 
@@ -190,6 +202,21 @@ def _serialize_candidate(
 def build_pipeline(
     dataset_dir: str | Path | None = None,
     include_audio: bool = False,
+    enable_campaign_features: bool = False,
+    enable_domain_features: bool = False,
+    enable_credential_link_features: bool = False,
+    enable_message_transaction_fit: bool = False,
+    enable_bill_pattern_features: bool = False,
+    llm_concurrency: int = 2,
 ) -> FraudDetectionPipeline:
-    settings = load_settings(dataset_dir, include_audio=include_audio)
+    settings = load_settings(
+        dataset_dir,
+        include_audio=include_audio,
+        enable_campaign_features=enable_campaign_features,
+        enable_domain_features=enable_domain_features,
+        enable_credential_link_features=enable_credential_link_features,
+        enable_message_transaction_fit=enable_message_transaction_fit,
+        enable_bill_pattern_features=enable_bill_pattern_features,
+        llm_concurrency=llm_concurrency,
+    )
     return FraudDetectionPipeline(settings)

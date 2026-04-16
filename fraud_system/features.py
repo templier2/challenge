@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import timedelta
 
+from fraud_system.config import Settings
 from fraud_system.data import Communication, Dataset, LocationPing, Transaction, UserProfile
 
 
@@ -36,6 +37,26 @@ SUSPICIOUS_DOMAINS = (
     "secure",
     "bit.ly",
 )
+CAMPAIGN_DESCRIPTION_MARKERS = (
+    "donation",
+    "supplier payment",
+    "consultant fee",
+    "invoice settlement",
+    "emergency fund transfer",
+    "phone bill",
+    "savings transfer",
+)
+BRAND_DOMAIN_HINTS = {
+    "paypal": ("paypal.com", "paypal."),
+    "amazon": ("amazon.",),
+    "uber": ("uber.com", "uber."),
+    "dhl": ("dhl.com", "dhl.", "dhlparcel."),
+    "barclays": ("barclays.co.uk", "barclays."),
+    "britishgas": ("britishgas.co.uk", "britishgas."),
+    "commerzbank": ("commerzbank.de", "commerzbank."),
+    "chase": ("chase.com", "chase."),
+    "unicredit": ("unicredit.it", "unicredit."),
+}
 
 
 @dataclass(slots=True)
@@ -45,6 +66,13 @@ class CommunicationSummary:
     recent_legit_count: int
     recent_summaries: list[dict[str, str | int | bool]]
     prompt_injection_attempts: int
+    login_alert_count: int
+    verify_link_count: int
+    payment_issue_count: int
+    delivery_fee_count: int
+    brand_mismatch_count: int
+    credential_link_count: int
+    recent_event_types: list[str]
 
 
 @dataclass(slots=True)
@@ -54,6 +82,7 @@ class CandidateTransaction:
     heuristic_score: float
     economic_risk_score: float
     sequence_score: float
+    campaign_score: float
     combined_score: float
     reasons: list[str]
     feature_map: dict[str, float | int | str | bool]
@@ -116,6 +145,74 @@ def _sanitize_snippet(text: str, limit: int = 120) -> str:
     return collapsed[:limit]
 
 
+def _message_event_types(message: Communication) -> set[str]:
+    text = f"{message.sender} {message.subject} {message.body}".lower()
+    event_types: set[str] = set()
+    if any(term in text for term in ("suspicious login", "unusual login", "sign-in", "logged in")):
+        event_types.add("login_alert")
+    if any(term in text for term in ("verify", "confirm", "restore access", "secure your account")):
+        event_types.add("verify_link")
+    if any(term in text for term in ("payment failed", "renewal failed", "update payment", "billing")):
+        event_types.add("payment_issue")
+    if any(term in text for term in ("parcel", "customs", "delivery fee", "release fee", "dhl")):
+        event_types.add("delivery_fee")
+    if _extract_urls(text):
+        event_types.add("has_link")
+    return event_types
+
+
+def _sender_domain(sender: str) -> str:
+    match = re.search(r"<[^@<>]+@([^<>]+)>", sender)
+    if match:
+        return match.group(1).lower()
+    match = re.search(r"@([A-Za-z0-9.-]+\.[A-Za-z]{2,})", sender)
+    if match:
+        return match.group(1).lower()
+    return ""
+
+
+def _brand_domain_mismatch(message: Communication) -> tuple[bool, str]:
+    text = f"{message.sender} {message.subject} {message.body}".lower()
+    domain = _sender_domain(message.sender)
+    if not domain:
+        return False, ""
+    for brand, expected_hints in BRAND_DOMAIN_HINTS.items():
+        if brand in text:
+            if not any(hint in domain for hint in expected_hints):
+                return True, brand
+            suspicious_brand_variant = brand.replace("a", "4").replace("o", "0").replace("i", "1")
+            if suspicious_brand_variant in domain and suspicious_brand_variant != brand:
+                return True, brand
+    if any(marker in domain for marker in SUSPICIOUS_DOMAINS):
+        for brand, expected_hints in BRAND_DOMAIN_HINTS.items():
+            if brand in text and not any(hint in domain for hint in expected_hints):
+                return True, brand
+    return False, ""
+
+
+def _credential_harvest_link(message: Communication) -> bool:
+    text = f"{message.sender} {message.subject} {message.body}".lower()
+    event_types = _message_event_types(message)
+    has_link = "has_link" in event_types
+    suspicious_domain = any(
+        any(marker in domain for marker in SUSPICIOUS_DOMAINS)
+        for domain in _extract_domains(text)
+    )
+    brand_mismatch, _ = _brand_domain_mismatch(message)
+    lure_language = any(
+        term in text
+        for term in (
+            "verify",
+            "confirm",
+            "restore access",
+            "update payment",
+            "suspicious login",
+            "unusual login",
+        )
+    )
+    return has_link and lure_language and (suspicious_domain or brand_mismatch)
+
+
 def _communication_summary(
     user: UserProfile,
     transaction: Transaction,
@@ -132,6 +229,9 @@ def _communication_summary(
     examples = []
     recent_summaries: list[dict[str, str | int | bool]] = []
     prompt_injection_attempts = 0
+    event_counter: Counter[str] = Counter()
+    brand_mismatch_count = 0
+    credential_link_count = 0
     for item in phishing[:3]:
         snippet = item.body.strip().replace("\n", " ")
         examples.append(snippet[:140])
@@ -139,13 +239,23 @@ def _communication_summary(
         text = f"{item.sender} {item.subject} {item.body}"
         domains = _extract_domains(text)
         injection_markers = _prompt_injection_markers(text)
+        event_types = _message_event_types(item)
+        brand_mismatch, mismatch_brand = _brand_domain_mismatch(item)
+        credential_link = _credential_harvest_link(item)
         prompt_injection_attempts += int(bool(injection_markers))
+        event_counter.update(event_types)
+        brand_mismatch_count += int(brand_mismatch)
+        credential_link_count += int(credential_link)
         recent_summaries.append(
             {
                 "channel": item.channel,
                 "sender": _sanitize_snippet(item.sender, 60),
                 "subject": _sanitize_snippet(item.subject, 80),
                 "snippet": _sanitize_snippet(item.body),
+                "event_types": ",".join(sorted(event_types)),
+                "brand_domain_mismatch": brand_mismatch,
+                "brand_mismatch_brand": mismatch_brand,
+                "credential_link": credential_link,
                 "suspicious_domains": ",".join(domains[:3]),
                 "has_suspicious_domain": any(
                     any(domain_marker in domain for domain_marker in SUSPICIOUS_DOMAINS)
@@ -164,6 +274,13 @@ def _communication_summary(
         recent_legit_count=len(legit),
         recent_summaries=recent_summaries,
         prompt_injection_attempts=prompt_injection_attempts,
+        login_alert_count=event_counter["login_alert"],
+        verify_link_count=event_counter["verify_link"],
+        payment_issue_count=event_counter["payment_issue"],
+        delivery_fee_count=event_counter["delivery_fee"],
+        brand_mismatch_count=brand_mismatch_count,
+        credential_link_count=credential_link_count,
+        recent_event_types=sorted(event_counter),
     )
 
 
@@ -232,6 +349,33 @@ def _description_tokens(description: str) -> set[str]:
 def _looks_like_recurring_obligation(description: str) -> bool:
     lowered = description.lower()
     markers = ("rent", "monthly plan", "insurance", "subscription", "bill", "premium")
+    return any(marker in lowered for marker in markers)
+
+
+def _campaign_template(description: str) -> str:
+    lowered = description.lower().strip()
+    if not lowered:
+        return ""
+    if lowered.startswith("rent payment") or _looks_like_recurring_obligation(description):
+        return ""
+    for marker in CAMPAIGN_DESCRIPTION_MARKERS:
+        if marker in lowered:
+            return marker
+    return ""
+
+
+def _bill_like_one_off_label(description: str) -> bool:
+    lowered = description.lower()
+    markers = (
+        "bill",
+        "invoice",
+        "supplier payment",
+        "consultant fee",
+        "service payment",
+        "phone bill",
+        "utility bill",
+        "donation",
+    )
     return any(marker in lowered for marker in markers)
 
 
@@ -311,6 +455,10 @@ def _sequence_risk(
     recurring_same_recipient: bool,
     recipient_global_count: int,
     first_recurring_obligation: bool,
+    enable_domain_features: bool,
+    enable_credential_link_features: bool,
+    enable_message_transaction_fit: bool,
+    enable_bill_pattern_features: bool,
 ) -> tuple[float, list[str], str]:
     score = 0.0
     reasons: list[str] = []
@@ -329,6 +477,123 @@ def _sequence_risk(
             score += 0.8
             reasons.append("meaningful balance drain shortly after phishing")
             archetypes.append("phishing_to_balance_drain")
+
+    if (
+        comms.login_alert_count >= 1
+        and comms.verify_link_count >= 1
+        and new_recipient
+        and transaction.transaction_type == "transfer"
+    ):
+        score += 1.0
+        reasons.append("new payee transfer follows login alert and verification lure")
+        archetypes.append("login_alert_to_new_payee")
+
+    if (
+        comms.payment_issue_count >= 1
+        and transaction.transaction_type in {"e-commerce", "direct debit"}
+        and new_recipient
+    ):
+        score += 0.8
+        reasons.append("first remote charge follows payment issue message")
+        archetypes.append("payment_issue_to_remote_charge")
+
+    if (
+        comms.delivery_fee_count >= 1
+        and transaction.transaction_type == "transfer"
+        and new_recipient
+        and transaction.amount <= 250
+    ):
+        score += 0.9
+        reasons.append("small new-payee transfer matches delivery-fee scam pattern")
+        archetypes.append("delivery_fee_to_small_transfer")
+
+    if enable_domain_features and comms.brand_mismatch_count >= 1:
+        if new_recipient and transaction.transaction_type == "transfer":
+            score += 1.0
+            reasons.append("new payee transfer follows brand/domain mismatch communication")
+            archetypes.append("brand_mismatch_to_new_payee")
+        elif transaction.transaction_type in {"e-commerce", "direct debit"}:
+            score += 0.8
+            reasons.append("remote charge follows brand/domain mismatch communication")
+            archetypes.append("brand_mismatch_to_remote_charge")
+        else:
+            score += 0.4
+            reasons.append("transaction follows communication with impersonated brand domain")
+            archetypes.append("brand_mismatch_contact")
+
+    if enable_credential_link_features and comms.credential_link_count >= 1:
+        if new_recipient and transaction.transaction_type == "transfer":
+            score += 1.1
+            reasons.append("new payee transfer follows credential-harvest link")
+            archetypes.append("credential_link_to_new_payee")
+        elif transaction.transaction_type in {"e-commerce", "direct debit"}:
+            score += 0.9
+            reasons.append("remote charge follows credential-harvest link")
+            archetypes.append("credential_link_to_remote_charge")
+        else:
+            score += 0.4
+            reasons.append("transaction follows message with likely credential-harvest link")
+            archetypes.append("credential_link_contact")
+
+    if enable_message_transaction_fit:
+        if (
+            comms.delivery_fee_count >= 1
+            and transaction.transaction_type == "transfer"
+            and transaction.amount <= 250
+        ):
+            score += 0.8
+            reasons.append("transaction amount/type fits a delivery-fee scam narrative")
+            archetypes.append("message_transaction_fit_delivery")
+        if (
+            comms.payment_issue_count >= 1
+            and transaction.transaction_type in {"e-commerce", "direct debit"}
+        ):
+            score += 0.7
+            reasons.append("remote payment fits a payment-update scam narrative")
+            archetypes.append("message_transaction_fit_payment")
+        if (
+            comms.login_alert_count >= 1
+            and comms.verify_link_count >= 1
+            and transaction.transaction_type == "transfer"
+            and new_recipient
+        ):
+            score += 0.8
+            reasons.append("new-payee transfer fits an account-takeover narrative")
+            archetypes.append("message_transaction_fit_takeover")
+        if (
+            comms.delivery_fee_count >= 1
+            and transaction.transaction_type == "transfer"
+            and transaction.amount >= 500
+        ):
+            score -= 0.6
+            reasons.append("large transfer is a poor fit for a delivery-fee message narrative")
+        if (
+            comms.payment_issue_count >= 1
+            and transaction.transaction_type == "transfer"
+            and transaction.amount >= 500
+        ):
+            score -= 0.5
+            reasons.append("large bank transfer is a weak fit for a payment-update narrative")
+
+    if enable_bill_pattern_features:
+        if (
+            transaction.transaction_type == "transfer"
+            and new_recipient
+            and _bill_like_one_off_label(transaction.description)
+            and not recurring_same_recipient
+            and not first_recurring_obligation
+        ):
+            score += 0.9
+            reasons.append("one-off bill-like transfer to a new payee is structurally suspicious")
+            archetypes.append("one_off_fake_bill")
+        if (
+            transaction.transaction_type == "transfer"
+            and recurring_same_recipient
+            and _bill_like_one_off_label(transaction.description)
+            and not recurring_break
+        ):
+            score -= 0.7
+            reasons.append("bill-like transfer stays consistent with an established payment pattern")
 
     if unusual_hour and transaction.amount >= 200:
         score += 0.7
@@ -374,6 +639,44 @@ def _sequence_risk(
 
     archetype = ",".join(dict.fromkeys(archetypes)) if archetypes else "none"
     return round(score, 3), reasons, archetype
+
+
+def _campaign_risk(
+    transaction: Transaction,
+    template_sender_count: int,
+    template_occurrence_count: int,
+    prefix_sender_count: int,
+    prefix_occurrence_count: int,
+    new_recipient: bool,
+) -> tuple[float, list[str], str]:
+    score = 0.0
+    reasons: list[str] = []
+    tags: list[str] = []
+
+    template = _campaign_template(transaction.description)
+    if template and template_sender_count >= 2 and template_occurrence_count >= 3:
+        score += 1.1
+        reasons.append("description matches a repeated cross-user transfer template")
+        tags.append("cross_user_template")
+        if new_recipient:
+            score += 0.5
+            reasons.append("template appears on a new recipient for this sender")
+            tags.append("template_to_new_payee")
+
+    prefix = (transaction.recipient_id or "")[:5]
+    if (
+        transaction.transaction_type == "transfer"
+        and prefix
+        and prefix_sender_count >= 2
+        and prefix_occurrence_count >= 3
+        and template
+    ):
+        score += 0.7
+        reasons.append("recipient prefix recurs across users inside the same suspicious template family")
+        tags.append("cross_user_recipient_family")
+
+    campaign_tag = ",".join(dict.fromkeys(tags)) if tags else "none"
+    return round(score, 3), reasons, campaign_tag
 
 
 def _economic_risk(
@@ -447,13 +750,31 @@ def _economic_risk(
     return round(score, 3), reasons
 
 
-def score_transactions(dataset: Dataset) -> list[CandidateTransaction]:
+def score_transactions(dataset: Dataset, settings: Settings | None = None) -> list[CandidateTransaction]:
+    enable_campaign_features = bool(settings and settings.enable_campaign_features)
+    enable_domain_features = bool(settings and settings.enable_domain_features)
+    enable_credential_link_features = bool(settings and settings.enable_credential_link_features)
+    enable_message_transaction_fit = bool(settings and settings.enable_message_transaction_fit)
+    enable_bill_pattern_features = bool(settings and settings.enable_bill_pattern_features)
     user_by_biotag = {user.biotag: user for user in dataset.users}
     history_by_sender: dict[str, list[Transaction]] = defaultdict(list)
     recipient_counter_by_sender: dict[str, Counter[str]] = defaultdict(Counter)
     recipient_global_counter: Counter[str] = Counter(
         transaction.recipient_id for transaction in dataset.transactions if transaction.recipient_id
     )
+    template_occurrence_counter: Counter[str] = Counter()
+    template_sender_sets: dict[str, set[str]] = defaultdict(set)
+    prefix_occurrence_counter: Counter[str] = Counter()
+    prefix_sender_sets: dict[str, set[str]] = defaultdict(set)
+    for item in dataset.transactions:
+        template = _campaign_template(item.description)
+        if template:
+            template_occurrence_counter[template] += 1
+            template_sender_sets[template].add(item.sender_id)
+        prefix = (item.recipient_id or "")[:5]
+        if prefix:
+            prefix_occurrence_counter[prefix] += 1
+            prefix_sender_sets[prefix].add(item.sender_id)
     candidates: list[CandidateTransaction] = []
 
     for transaction in dataset.transactions:
@@ -500,6 +821,8 @@ def score_transactions(dataset: Dataset) -> list[CandidateTransaction]:
             description_shift=recipient_description_shift,
         )
         latest_phishing_hours = _latest_phishing_delta_hours(user, transaction, dataset.communications)
+        campaign_template = _campaign_template(transaction.description)
+        recipient_prefix = (transaction.recipient_id or "")[:5]
 
         reasons: list[str] = []
         score = 0.0
@@ -590,8 +913,25 @@ def score_transactions(dataset: Dataset) -> list[CandidateTransaction]:
             recurring_same_recipient=recurring_same_recipient,
             recipient_global_count=recipient_global_count,
             first_recurring_obligation=first_recurring_obligation,
+            enable_domain_features=enable_domain_features,
+            enable_credential_link_features=enable_credential_link_features,
+            enable_message_transaction_fit=enable_message_transaction_fit,
+            enable_bill_pattern_features=enable_bill_pattern_features,
         )
-        combined_score = score + 1.2 * economic_risk_score + 1.1 * sequence_score
+        if enable_campaign_features:
+            campaign_score, campaign_reasons, campaign_tag = _campaign_risk(
+                transaction=transaction,
+                template_sender_count=len(template_sender_sets[campaign_template]) if campaign_template else 0,
+                template_occurrence_count=template_occurrence_counter[campaign_template]
+                if campaign_template
+                else 0,
+                prefix_sender_count=len(prefix_sender_sets[recipient_prefix]) if recipient_prefix else 0,
+                prefix_occurrence_count=prefix_occurrence_counter[recipient_prefix] if recipient_prefix else 0,
+                new_recipient=new_recipient,
+            )
+        else:
+            campaign_score, campaign_reasons, campaign_tag = 0.0, [], "disabled"
+        combined_score = score + 1.2 * economic_risk_score + 1.1 * sequence_score + campaign_score
 
         network_summary = {
             "new_recipient": new_recipient,
@@ -608,6 +948,7 @@ def score_transactions(dataset: Dataset) -> list[CandidateTransaction]:
             if latest_phishing_hours is not None
             else -1.0,
             "fraud_archetype": fraud_archetype,
+            "campaign_tag": campaign_tag,
         }
 
         feature_map = {
@@ -618,6 +959,14 @@ def score_transactions(dataset: Dataset) -> list[CandidateTransaction]:
             "drain_ratio": round(drain_ratio, 3),
             "recent_phishing_count": comms.recent_phishing_count,
             "recent_legit_count": comms.recent_legit_count,
+            "login_alert_count": comms.login_alert_count,
+            "verify_link_count": comms.verify_link_count,
+            "payment_issue_count": comms.payment_issue_count,
+            "delivery_fee_count": comms.delivery_fee_count,
+            "brand_mismatch_count": comms.brand_mismatch_count,
+            "credential_link_count": comms.credential_link_count,
+            "campaign_score": campaign_score,
+            "campaign_template": campaign_template,
             "new_recipient": new_recipient,
             "recipient_global_count": recipient_global_count,
             "salary_ratio": round(transaction.amount / max(user.salary / 12.0, 1.0), 3),
@@ -637,8 +986,9 @@ def score_transactions(dataset: Dataset) -> list[CandidateTransaction]:
                 heuristic_score=round(score, 3),
                 economic_risk_score=economic_risk_score,
                 sequence_score=sequence_score,
+                campaign_score=campaign_score,
                 combined_score=round(combined_score, 3),
-                reasons=reasons + economic_reasons + sequence_reasons,
+                reasons=reasons + economic_reasons + sequence_reasons + campaign_reasons,
                 feature_map=feature_map,
                 communication_summary=comms,
                 location_summary=location,
