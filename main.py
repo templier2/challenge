@@ -25,6 +25,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to the ASCII output file where suspicious transaction IDs will be written, one per line.",
     )
     parser.add_argument(
+        "--audio",
+        action="store_true",
+        help="Enable optional audio transcription input if the dataset contains an audio directory.",
+    )
+    parser.add_argument(
         "--threshold",
         type=float,
         default=0.5,
@@ -55,7 +60,7 @@ def main() -> None:
     if not args.report and not args.output_file:
         raise SystemExit("--output-file is required unless --report is used.")
 
-    pipeline = build_pipeline(args.dataset_dir)
+    pipeline = build_pipeline(args.dataset_dir, include_audio=args.audio)
     result = pipeline.run(
         threshold=args.threshold,
         max_fraud_ratio=args.max_fraud_ratio,

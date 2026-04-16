@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover
 @dataclass(slots=True)
 class Settings:
     dataset_dir: Path
+    include_audio: bool
     openrouter_api_key: str | None
     openrouter_model: str
     langfuse_public_key: str | None
@@ -30,11 +31,15 @@ class Settings:
         return bool(self.langfuse_public_key and self.langfuse_secret_key)
 
 
-def load_settings(dataset_dir: str | Path | None = None) -> Settings:
+def load_settings(
+    dataset_dir: str | Path | None = None,
+    include_audio: bool = False,
+) -> Settings:
     load_dotenv()
     resolved_dataset_dir = Path(dataset_dir or "The Truman Show - train").resolve()
     return Settings(
         dataset_dir=resolved_dataset_dir,
+        include_audio=include_audio,
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
         openrouter_model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
         langfuse_public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),

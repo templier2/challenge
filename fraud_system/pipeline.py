@@ -21,7 +21,7 @@ class DetectionResult:
 class FraudDetectionPipeline:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.dataset = load_dataset(settings.dataset_dir)
+        self.dataset = load_dataset(settings.dataset_dir, include_audio=settings.include_audio)
         self.orchestrator = FraudAgentOrchestrator(settings)
         self.progress = ProgressReporter(enabled=True)
 
@@ -109,18 +109,32 @@ class FraudDetectionPipeline:
             by=["combined_score", "sequence_score", "economic_risk_score", "heuristic_score"],
             ascending=False,
         )
-        shortlist = frame[
+        strong = frame[
+            (frame["combined_score"] >= 2.5)
+            | (frame["sequence_score"] >= 1.5)
+            | (frame["economic_risk_score"] >= 2.0)
+            | (frame["final_label"] == "fraud")
+        ]
+        reserve = frame[
             (frame["combined_score"] >= 0.75)
             | (frame["sequence_score"] >= 1.0)
             | (frame["economic_risk_score"] >= 1.0)
             | (frame["heuristic_score"] >= 1.0)
         ]
-        global_cap = max(60, min(len(frame), int(len(frame) * 0.35)))
-        sender_cap = 24
+        reserve = reserve[~reserve["transaction_id"].isin(set(strong["transaction_id"]))]
 
-        top_global = shortlist.head(global_cap)
-        top_per_sender = shortlist.groupby("sender_id", sort=False).head(sender_cap)
-        merged = pd.concat([top_global, top_per_sender], ignore_index=True).drop_duplicates(
+        strong_sender_cap = 18
+        reserve_sender_cap = 8
+        reserve_global_cap = max(40, min(len(frame), int(len(frame) * 0.15)))
+
+        strong_per_sender = strong.groupby("sender_id", sort=False).head(strong_sender_cap)
+        reserve_global = reserve.head(reserve_global_cap)
+        reserve_per_sender = reserve.groupby("sender_id", sort=False).head(reserve_sender_cap)
+
+        merged = pd.concat(
+            [strong_per_sender, reserve_global, reserve_per_sender],
+            ignore_index=True,
+        ).drop_duplicates(
             subset=["transaction_id"]
         )
         ids = merged["transaction_id"].tolist()
@@ -173,6 +187,9 @@ def _serialize_candidate(
     }
 
 
-def build_pipeline(dataset_dir: str | Path | None = None) -> FraudDetectionPipeline:
-    settings = load_settings(dataset_dir)
+def build_pipeline(
+    dataset_dir: str | Path | None = None,
+    include_audio: bool = False,
+) -> FraudDetectionPipeline:
+    settings = load_settings(dataset_dir, include_audio=include_audio)
     return FraudDetectionPipeline(settings)

@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from faster_whisper import WhisperModel
+
 
 def parse_datetime(value: str, fmt: str | None = None) -> datetime:
     if fmt:
@@ -215,38 +215,41 @@ def load_mails(dataset_dir: Path, users: list[UserProfile]) -> list[Communicatio
         )
     return communications
 
-model = WhisperModel("small", device="cpu", compute_type="int8")
 
-def load_audio(dataset_dir: Path, model) -> list[Communication]:
+def load_audio(dataset_dir: Path, users: list[UserProfile]) -> list[Communication]:
     audio_dir = dataset_dir / "audio"
-
     if not audio_dir.exists() or not audio_dir.is_dir():
         return []
 
-    files = [f for f in os.listdir(audio_dir) if f.endswith(".mp3")]
-    if not files:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
         return []
 
-    communications = []
+    audio_files = sorted(audio_dir.glob("*.mp3"))
+    if not audio_files:
+        return []
 
-    for file_name in files:
-        file_path = audio_dir / file_name
-        name_without_ext = file_path.stem
+    model = WhisperModel("small", device="cpu", compute_type="int8")
+    communications: list[Communication] = []
 
-        segments, _ = model.transcribe(
-            str(file_path),
-            language="en"
-        )
-
+    for file_path in audio_files:
+        segments, _ = model.transcribe(str(file_path), language="en")
         text = " ".join(segment.text for segment in segments).strip()
+        if not text:
+            continue
+
+        user_biotag = _assign_user(text, users)
+        if not user_biotag:
+            continue
 
         communications.append(
             Communication(
                 channel="audio",
-                user_biotag=None,
-                sender=name_without_ext,
-                timestamp=None,
-                subject=None,
+                user_biotag=user_biotag,
+                sender=file_path.stem,
+                timestamp=datetime.fromtimestamp(file_path.stat().st_mtime),
+                subject="audio transcript",
                 body=text,
             )
         )
@@ -254,12 +257,11 @@ def load_audio(dataset_dir: Path, model) -> list[Communication]:
     return communications
 
 
-def load_dataset(dataset_dir: Path) -> Dataset:
+def load_dataset(dataset_dir: Path, include_audio: bool = False) -> Dataset:
     users = load_users(dataset_dir)
-    if load_audio(dataset_dir: Path, model)==[]:
-        communications = load_sms(dataset_dir, users) + load_mails(dataset_dir, users)
-    else:
-        communications = load_sms(dataset_dir, users) + load_mails(dataset_dir, users) + load_audio(dataset_dir: Path, model)
+    communications = load_sms(dataset_dir, users) + load_mails(dataset_dir, users)
+    if include_audio:
+        communications.extend(load_audio(dataset_dir, users))
     return Dataset(
         users=users,
         transactions=load_transactions(dataset_dir),
